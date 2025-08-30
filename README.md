@@ -27,7 +27,7 @@ This project is an enhanced and production-hardened version inspired by the orig
 Install the package directly from PyPI:
 
 ```bash
-pip install cache_to_disk
+pip install cache2disk
 ```
 
 Or, install from GitHub for the latest version:
