@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.6"
 license = {text = "MIT License"}
 authors = [
-  {name = "Atakey", email = "hhl_helonky@163.com"}, # 替换为您的信息
+  {name = "Atakey", email = "hhl_helonky@163.com"},
 ]
 keywords = ["cache", "disk", "decorator", "performance", "async", "filelock"]
 classifiers = [
