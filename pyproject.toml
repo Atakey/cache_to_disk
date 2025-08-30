@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cache_to_disk"
-version = "4.2.0"
+version = "4.2.1"
 description = "A powerful and robust Python decorator for caching function results to disk."
 readme = "README.md"
 requires-python = ">=3.6"
