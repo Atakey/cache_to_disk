@@ -8,7 +8,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="cache_to_disk",
-    version="4.2.0",
+    version="4.2.1",
     author="huanghailong",
     author_email="hhl_helonky@163.com",
     description="A local disk caching decorator for Python functions",
