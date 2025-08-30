@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cache_to_disk"
+name = "cache2disk"
 version = "4.2.1"
 description = "A powerful and robust Python decorator for caching function results to disk."
 readme = "README.md"
