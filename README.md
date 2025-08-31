@@ -210,7 +210,7 @@ The cache is stored in a local directory on your file system. To clear all cache
 
 You can find the installation path with:
 ```bash
-pip show cache_to_disk
+pip show cache2disk
 ```
 Then, navigate to the `Location` and delete the `disk_cache` folder.
 
