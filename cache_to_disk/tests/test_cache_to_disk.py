@@ -19,6 +19,7 @@ from .. import (
     generate_cache_key,
     is_off_caching,
     load_cache_metadata_json,
+    delete_disk_caches
 )
 
 
@@ -296,6 +297,89 @@ class TestCacheConcurrency(unittest.TestCase):
         metadata = load_cache_metadata_json(self.cache_file)
         for key in test_keys:
             self.assertNotIn(key, metadata)
+
+
+class TestCacheCleanupFeatures(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.cache_dir = os.path.join(self.test_dir, "disk_cache")
+        self.cache_file = os.path.join(self.cache_dir, "cache_to_disk_caches.json")
+
+        self.env_patcher = patch.dict(os.environ, {
+            "DISK_CACHE_DIR": self.cache_dir,
+            "DISK_CACHE_FILENAME": "cache_to_disk_caches.json",
+            "DISK_CACHE_MODE": "on",
+            "DISK_CACHE_LOCK_TIMEOUT": "5"
+        })
+        self.env_patcher.start()
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+        if 'cache_to_disk' in sys.modules:
+            del sys.modules['cache_to_disk']
+        from .. import DISK_CACHE_DIR, DISK_CACHE_FILE
+        self.assertEqual(DISK_CACHE_DIR, self.cache_dir)
+        self.assertEqual(DISK_CACHE_FILE, self.cache_file)
+
+    def tearDown(self):
+        self.env_patcher.stop()
+        shutil.rmtree(self.test_dir)
+
+    def test_delete_by_date_string(self):
+        """Test delete_disk_caches with date string min_age/max_age."""
+        from .. import cache_function_value, load_cache_metadata_json
+
+        # Create two cache entries
+        cache_function_value({"data": "old"}, 7, "old_key", self.cache_dir, self.cache_file)
+        cache_function_value({"data": "new"}, 7, "new_key", self.cache_dir, self.cache_file)
+
+        # Modify timestamps
+        old_file = os.path.join(self.cache_dir, "old_key.pkl")
+        new_file = os.path.join(self.cache_dir, "new_key.pkl")
+        old_time = (datetime.now() - timedelta(days=5)).timestamp()
+        new_time = datetime.now().timestamp()
+        os.utime(old_file, (old_time, old_time))
+        os.utime(new_file, (new_time, new_time))
+
+        # Delete entries older than 3 days
+        cutoff_date = (datetime.now() - timedelta(days=3)).strftime("%Y/%m/%d %H:%M:%S")
+        deleted_count = delete_disk_caches(min_age=cutoff_date, cache_dir=self.cache_dir, cache_file=self.cache_file)
+        self.assertEqual(deleted_count, 1)
+
+        metadata = load_cache_metadata_json(self.cache_file)
+        self.assertNotIn("old_key", metadata)
+        self.assertIn("new_key", metadata)
+
+    def test_delete_by_prefix(self):
+        """Test delete_disk_caches with prefix."""
+
+        cache_function_value({"data": "p1"}, 7, "prefix_key1", self.cache_dir, self.cache_file)
+        cache_function_value({"data": "p2"}, 7, "prefix_key2", self.cache_dir, self.cache_file)
+        cache_function_value({"data": "other"}, 7, "other_key", self.cache_dir, self.cache_file)
+
+        deleted_count = delete_disk_caches(prefix="prefix_", cache_dir=self.cache_dir, cache_file=self.cache_file)
+        self.assertEqual(deleted_count, 2)
+
+        metadata = load_cache_metadata_json(self.cache_file)
+        self.assertNotIn("prefix_key1", metadata)
+        self.assertNotIn("prefix_key2", metadata)
+        self.assertIn("other_key", metadata)
+
+    def test_delete_with_filter_func(self):
+        """Test delete_disk_caches with custom filter function."""
+
+        cache_function_value({"data": "keep"}, 7, "keep_key", self.cache_dir, self.cache_file)
+        cache_function_value({"data": "remove"}, 7, "remove_key", self.cache_dir, self.cache_file)
+
+        def filter_func(key, meta):
+            return "remove" in key
+
+        deleted_count = delete_disk_caches(filter_func=filter_func, cache_dir=self.cache_dir,
+                                           cache_file=self.cache_file)
+        self.assertEqual(deleted_count, 1)
+
+        metadata = load_cache_metadata_json(self.cache_file)
+        self.assertNotIn("remove_key", metadata)
+        self.assertIn("keep_key", metadata)
 
 
 if __name__ == "__main__":
