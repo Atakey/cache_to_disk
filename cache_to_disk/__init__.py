@@ -12,7 +12,7 @@ from collections.abc import Mapping, Set
 from datetime import datetime, timedelta
 from functools import partial, wraps
 from os import getenv, listdir, makedirs, remove
-from os.path import (basename, dirname, exists as file_exists, expanduser,
+from os.path import (dirname, exists as file_exists, expanduser,
                      expandvars, getmtime, join as join_path, realpath)
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
@@ -23,6 +23,7 @@ __all__ = [
     "cache_to_disk", "NoCacheCondition",
     "is_off_caching", "load_cache_metadata_json",
     "generate_cache_key", "cache_exists", "cache_function_value",
+    "delete_disk_caches",
 ]
 
 logger = logging.getLogger(__name__)
@@ -205,7 +206,21 @@ def generate_cache_key(func: Callable, *args: Any, **kwargs: Any) -> str:
         hasher.update(_serialize(args))
         hasher.update(b"fallback_kwargs:")
         hasher.update(_serialize(kwargs))
-    return hasher.hexdigest()
+
+    digest = hasher.hexdigest()
+    # Find the original function to get its name, unwrapping `partial` if necessary.
+    original_func = func
+    while isinstance(original_func, partial):
+        original_func = original_func.func
+
+    # Prefix the hash with the function's qualified name for better readability.
+    try:
+        func_name = original_func.__qualname__
+    except AttributeError:
+        # Fallback for callables that don't have __qualname__ (e.g., some C-level callables)
+        func_name = "unknown_callable"
+
+    return f"{func_name}_{digest}"
 
 
 def _get_file_age(filename: PathOrStr, unit: str = 'days') -> int:
@@ -323,13 +338,10 @@ def cache_exists(
     max_age_days = int(function_cache.get('max_age_days', DEFAULT_CACHE_AGE))
     file_name = join_path(cache_dir, function_cache['file_name'])
     if not file_exists(file_name):
-        logger.info('Metadata points to non-existent file %s for key %s.', file_name, cache_key)
         return False, None
 
     file_age = _get_file_age(file_name)
     if file_age >= max_age_days:
-        logger.info('Cache file %s for key %s is stale (age: %d days, max: %d days).', file_name, cache_key,
-                    file_age, max_age_days)
         return False, None
 
     try:
@@ -475,74 +487,185 @@ def cache_to_disk(
     return decorator(func) if func else decorator
 
 
+def _parse_datetime_input(dt_input: Optional[Union[str, datetime]]) -> Optional[datetime]:
+    """
+    Parses a datetime input which can be either a datetime object or a string.
+    Supported string formats:
+        - "YYYY/MM/DD HH:MM:SS"
+        - "YYYY-MM-DD HH:MM:SS"
+        - "YYYY/MM/DD" (defaults to 00:00:00)
+        - "YYYY-MM-DD" (defaults to 00:00:00)
+    """
+    if dt_input is None:
+        return None
+    if isinstance(dt_input, datetime):
+        return dt_input
+
+    if isinstance(dt_input, str):
+        dt_input = dt_input.strip()
+        formats = [
+            "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d", "%Y-%m-%d",
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(dt_input, fmt)
+            except ValueError:
+                continue
+        raise ValueError(f"Unable to parse datetime string: {dt_input}")
+
+    raise TypeError(f"Unsupported datetime input type: {type(dt_input)}")
+
+
+def _generic_cache_cleanup(
+        should_delete_func: Callable[[str, Dict[str, Any]], bool],
+        cleanup_orphans: bool,
+        cache_dir: PathOrStr,
+        cache_file: PathOrStr,
+) -> int:
+    """
+    Generic internal function to perform cache cleanup.
+
+    This function atomically updates the metadata file by removing entries that
+    match the `should_delete_func` predicate, and then deletes the corresponding
+    .pkl files. It can also optionally clean up orphaned .pkl files.
+
+    Args:
+        should_delete_func: A callable that takes (cache_key, metadata_dict) and
+                            returns True if the entry should be deleted.
+        cleanup_orphans: If True, also remove orphan .pkl files not in metadata.
+        cache_dir: The directory where cache files are stored.
+        cache_file: The path to the cache metadata JSON file.
+
+    Returns:
+        The number of cache entries that were deleted.
+    """
+    deleted_items_meta = {}
+
+    def update_and_clean_metadata(current_meta: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal deleted_items_meta
+
+        keys_to_delete = {
+            key for key, meta in current_meta.items()
+            if should_delete_func(key, meta)
+        }
+
+        # Store metadata of items to be deleted for later file removal
+        deleted_items_meta = {k: current_meta[k] for k in keys_to_delete}
+
+        # Create the new metadata dictionary
+        new_meta = {k: v for k, v in current_meta.items() if k not in keys_to_delete}
+
+        if cleanup_orphans and file_exists(cache_dir):
+            valid_files = {meta.get('file_name') for meta in new_meta.values() if meta.get('file_name')}
+            for file_in_dir in listdir(cache_dir):
+                if file_in_dir.endswith('.pkl') and file_in_dir not in valid_files:
+                    full_path = join_path(cache_dir, file_in_dir)
+                    try:
+                        remove(full_path)
+                        logger.info(f"Removed orphaned cache file: {full_path}")
+                    except OSError as e:
+                        logger.error(f"Failed to remove orphaned cache file {full_path}: {e}")
+
+        return new_meta
+
+    try:
+        _update_cache_metadata_with_lock(update_and_clean_metadata, cache_file)
+    except Exception as e:
+        logger.error(f"Failed to update cache metadata during cleanup: {e}")
+        return 0
+
+    # After metadata is updated, remove the corresponding cache files
+    for key, meta in deleted_items_meta.items():
+        file_name = meta.get('file_name')
+        if file_name:
+            file_path = join_path(cache_dir, file_name)
+            if file_exists(file_path):
+                try:
+                    remove(file_path)
+                except OSError as e:
+                    logger.error(f"Failed to delete cache file {file_path} for key {key}: {e}")
+
+    return len(deleted_items_meta)
+
+
+def delete_disk_caches(
+        prefix: Optional[str] = None,
+        min_age: Optional[Union[str, datetime]] = None,
+        max_age: Optional[Union[str, datetime]] = None,
+        filter_func: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
+        cache_dir: PathOrStr = DISK_CACHE_DIR,
+        cache_file: PathOrStr = DISK_CACHE_FILE,
+) -> int:
+    """
+    Deletes cache entries based on specified criteria.
+    """
+    min_age_dt = _parse_datetime_input(min_age)
+    max_age_dt = _parse_datetime_input(max_age)
+
+    if all(arg is None for arg in [prefix, min_age_dt, max_age_dt, filter_func]):
+        logger.info("delete_disk_caches called without any criteria, no action taken.")
+        return 0
+
+    def should_delete(key: str, meta: Dict[str, Any]) -> bool:
+        # 1. Prefix check
+        if prefix and not key.startswith(prefix):
+            return False
+
+        # 2. Age check
+        if min_age_dt or max_age_dt:
+            file_name = meta.get('file_name')
+            if not file_name: return True  # Treat missing file as deletable
+
+            file_path = join_path(cache_dir, file_name)
+            if not file_exists(file_path): return True
+
+            try:
+                file_time = datetime.fromtimestamp(getmtime(file_path))
+                if min_age_dt and file_time > min_age_dt: return False
+                if max_age_dt and file_time < max_age_dt: return False
+            except OSError:
+                return False  # Cannot stat file, do not delete
+
+        # 3. Custom filter check
+        if filter_func:
+            try:
+                if not filter_func(key, meta):
+                    return False
+            except Exception as e:
+                logger.error(f"Custom filter function failed for key '{key}': {e}")
+                return False
+
+        return True
+
+    return _generic_cache_cleanup(should_delete, False, cache_dir, cache_file)
+
+
 def _delete_old_disk_caches(
         days: int = 1,
         cache_dir: PathOrStr = DISK_CACHE_DIR,
         cache_file: PathOrStr = DISK_CACHE_FILE,
 ) -> None:
     """
-    Performs cleanup of the cache directory.
-
-    This function removes:
-    1. Stale cache entries (both .pkl file and metadata).
-    2. Orphaned .pkl files (not referenced in metadata).
-    3. Orphaned or stale .lock files.
-
-    To avoid excessive I/O, this cleanup only runs if the metadata file itself
-    hasn't been modified in the last `days`.
+    Performs routine cleanup of the cache directory.
     """
     try:
-        with FileLock(cache_file + LOCK_SUFFIX, read_only_ok=False, timeout=FILE_LOCK_TIMEOUT):
-            # Avoid running cleanup too frequently by checking the metadata file's modification time.
-            if file_exists(cache_file):
-                last_cleanup_time = datetime.fromtimestamp(getmtime(cache_file))
-                if datetime.now() - last_cleanup_time < timedelta(days=days):
-                    return  # Skip cleanup if it was run recently.
+        # with FileLock(cache_file + LOCK_SUFFIX, read_only_ok=False, timeout=FILE_LOCK_TIMEOUT):
+        if file_exists(cache_file):
+            if datetime.now() - datetime.fromtimestamp(getmtime(cache_file)) < timedelta(days=days):
+                return
 
-            cache_metadata = _load_cache_metadata_json_no_lock(cache_file)
-            updated_metadata = {}
-            valid_cache_files = set()
+        def should_delete_stale(key: str, meta: Dict[str, Any]) -> bool:
+            max_age_days = int(meta.get('max_age_days', DEFAULT_CACHE_AGE))
+            file_name = meta.get('file_name')
+            if not file_name: return True
 
-            # Step 1: Iterate through metadata, keeping only valid and non-stale entries.
-            for cache_key, function_cache in cache_metadata.items():
-                max_age_days = int(function_cache.get('max_age_days', DEFAULT_CACHE_AGE))
-                file_name_pkl = function_cache.get('file_name')
-                if not file_name_pkl:
-                    continue
+            full_path = join_path(cache_dir, file_name)
+            if not file_exists(full_path): return True
 
-                full_file_path = join_path(cache_dir, file_name_pkl)
-                if not file_exists(full_file_path) or _get_file_age(full_file_path) >= max_age_days:
-                    logger.info(f'Removing stale or missing cache entry for key {cache_key}.')
-                    if file_exists(full_file_path):
-                        try:
-                            remove(full_file_path)
-                        except OSError as e:
-                            logger.error(f"Failed to remove stale cache file {full_file_path}: {e}")
-                    continue  # Entry is removed by not adding it to updated_metadata.
+            return _get_file_age(full_path) >= max_age_days
 
-                # If the entry is valid, keep it.
-                updated_metadata[cache_key] = function_cache
-                valid_cache_files.add(file_name_pkl)
-
-            # Step 2: Scan the cache directory for orphaned files.
-            if file_exists(cache_dir):
-                for file_in_dir in listdir(cache_dir):
-                    # Skip the metadata file itself and its primary lock.
-                    if file_in_dir == basename(cache_file) or file_in_dir == basename(cache_file) + LOCK_SUFFIX:
-                        continue
-
-                    if file_in_dir.endswith('.pkl') and file_in_dir not in valid_cache_files:
-                        logger.info(f'Removing orphaned cache file: {file_in_dir}')
-                        try:
-                            remove(join_path(cache_dir, file_in_dir))
-                        except OSError as e:
-                            logger.error(f"Failed to remove orphaned cache file {file_in_dir}: {e}")
-
-            # Step 3: Write the cleaned metadata back to the file if it has changed.
-            if updated_metadata != cache_metadata:
-                _write_cache_file_no_lock(updated_metadata, cache_file)
-
-            logger.info("Disk cache cleanup finished.")
+        _generic_cache_cleanup(should_delete_stale, True, cache_dir, cache_file)
 
     except FileLockTimeout:
         logger.warning(f"Could not acquire lock for disk cache cleanup on {cache_file}. Skipping.")
