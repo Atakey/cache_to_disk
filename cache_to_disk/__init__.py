@@ -4,6 +4,7 @@ import inspect
 import logging
 import os
 import pickle
+import re
 import threading
 import time
 import uuid
@@ -219,8 +220,8 @@ def generate_cache_key(func: Callable, *args: Any, **kwargs: Any) -> str:
     except AttributeError:
         # Fallback for callables that don't have __qualname__ (e.g., some C-level callables)
         func_name = "unknown_callable"
-
-    return f"{func_name}_{digest}"
+    safe_func_name = re.sub(r'[^a-zA-Z0-9_.]', '_', func_name)
+    return f"{safe_func_name}_{digest}"
 
 
 def _get_file_age(filename: PathOrStr, unit: str = 'days') -> int:
